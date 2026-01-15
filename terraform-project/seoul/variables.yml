@@ -1,0 +1,170 @@
+# Region
+region: ap-northeast-2
+region_name: seoul
+
+# VPC CIDR
+cidr_block: 10.2.0.0/16
+
+# Availability Zones
+az_count: 2
+
+# Subnet bits 
+subnet_bits: 8
+
+# Subnet counts
+public_subnet_count: 2
+private_subnet_count: 2
+
+# Security Groups
+security_groups:
+  
+  web:
+    name: "web-sg"
+    ingress_rules:
+      ssh:
+        protocol: "tcp"
+        from_port: 22
+        to_port: 22
+        cidr_blocks: ["0.0.0.0/0"]
+      http:
+        protocol: "tcp"
+        from_port: 80
+        to_port: 80
+        cidr_blocks: ["0.0.0.0/0"]
+    egress_rules:
+      all:
+        protocol: "-1"
+        from_port: 0
+        to_port: 0
+        cidr_blocks: ["0.0.0.0/0"]
+
+  # ALB
+  alb:
+    name: "alb-sg"
+    ingress_rules:
+      http:
+        protocol: "tcp"
+        from_port: 80
+        to_port: 80
+        cidr_blocks: ["0.0.0.0/0"]
+    egress_rules:
+      all:
+        protocol: "-1"
+        from_port: 0
+        to_port: 0
+        cidr_blocks: ["0.0.0.0/0"]
+
+  # RDS (allow from VPC CIDR)
+  rds:
+    name: "rds-sg"
+    ingress_rules:
+      mysql:
+        protocol: "tcp"
+        from_port: 3306
+        to_port: 3306
+        cidr_blocks: ["10.2.0.0/16"]
+    egress_rules:
+      all:
+        protocol: "-1"
+        from_port: 0
+        to_port: 0
+        cidr_blocks: ["0.0.0.0/0"]
+
+  # EFS (NFS) allow from VPC CIDR
+  efs:
+    name: "efs-sg"
+    ingress_rules:
+      nfs:
+        protocol: "tcp"
+        from_port: 2049
+        to_port: 2049
+        cidr_blocks: ["10.2.0.0/16"]
+    egress_rules:
+      all:
+        protocol: "-1"
+        from_port: 0
+        to_port: 0
+        cidr_blocks: ["0.0.0.0/0"]
+
+# Key generation
+key_info:
+  algorithm: "RSA"
+  rsa_bits: 2048
+
+# Auto Scaling Group (web)
+asg:
+  ami: "ami-07b70db997adb22fb"
+  instance_type: "t3.micro"
+  desired_capacity: 1
+  min_size: 1
+  max_size: 2
+  cpu_target_value: 50
+
+# ALB
+alb:
+  health_check_path: "/index.html"
+
+# RDS (MariaDB)
+rds:
+  engine: "mariadb"
+  engine_version: "10.11"
+  instance_class: "db.t3.micro"
+  allocated_storage: 20
+  initial_db_name: "app"
+  master_username: "admin"
+  master_password: "Password"  
+
+# App DB/users
+apps:
+  dvwa:
+    db_name: "dvwa"
+    db_user: "dvwa"
+    db_password: "Password"
+  gnuboard:
+    db_name: "gnuboard"
+    db_user: "admin"
+    db_password: "Password"
+    admin_id: "webmaster"
+    admin_password: "Password"
+    admin_email: "webmaster@iac.it-edu.org"
+  wordpress:
+    db_name: "wordpress"
+    db_user: "admin"
+    db_password: "Password"
+    admin_user: "wpadmin"
+    admin_password: "Password"
+    admin_email: "webmaster@iac.it-edu.org"
+    site_title: "WordPress"
+
+
+waf:
+  enabled: true
+  scope: "REGIONAL"
+  log_retention_days: 7
+
+  # 공통으로 적용할 AWS Managed RuleSet 
+  managed_rule_sets:
+    - "AWSManagedRulesCommonRuleSet"
+    - "AWSManagedRulesSQLiRuleSet"
+    - "AWSManagedRulesWordPressRuleSet"
+
+  # 간단 Rate limit 
+  rate_limit:
+    enabled: true
+    limit: 2000   
+
+  # 서비스별 WAF 이름(가독성)
+  per_service:
+    dvwa:
+      name: "seoul-waf-dvwa"
+    gnuboard:
+      name: "seoul-waf-gnuboard"
+    wordpress:
+      name: "seoul-waf-wordpress"
+
+# Route53
+
+route53:
+  zone_id: "Z02942151A1W9E0GJTDKK"
+  db_record_name: "db.iac.it-edu.org"
+

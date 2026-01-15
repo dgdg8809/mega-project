@@ -1,0 +1,261 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+
+dnf -y clean all
+dnf -y install --allowerasing \
+  httpd \
+  php8.3 php8.3-cli php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip \
+  php8.3-mysqlnd php8.3-fpm mariadb105 \
+  git unzip amazon-efs-utils curl-minimal nc
+
+dnf -y install php-curl || true
+dnf -y install mariadb105 || true
+
+
+if ! command -v php >/dev/null 2>&1; then
+  if command -v php8.3 >/dev/null 2>&1; then
+    ln -sf "$(command -v php8.3)" /usr/bin/php
+  fi
+fi
+command -v php >/dev/null 2>&1 || { echo "[ERROR] php command not found"; exit 1; }
+
+systemctl enable --now httpd
+systemctl enable --now php-fpm
+
+DB_HOST='${DB_HOST}'
+DB_PORT='${DB_PORT}'
+RDS_MASTER='${RDS_MASTER}'
+RDS_MASTER_PW='${RDS_MASTER_PW}'
+
+G5_DB='${G5_DB}'
+G5_USER='${G5_USER}'
+G5_PASS='${G5_PASS}'
+
+
+BASE_URL='${BASE_URL}'
+
+ADMIN_ID='${ADMIN_ID}'
+ADMIN_PW='${ADMIN_PW}'
+ADMIN_EMAIL='${ADMIN_EMAIL}'
+
+
+: "$${DB_HOST:?}"
+: "$${DB_PORT:?}"
+: "$${RDS_MASTER:?}"
+: "$${RDS_MASTER_PW:?}"
+: "$${G5_DB:?}"
+: "$${G5_USER:?}"
+: "$${G5_PASS:?}"
+: "$${BASE_URL:?}"
+: "$${ADMIN_ID:?}"
+: "$${ADMIN_PW:?}"
+: "$${ADMIN_EMAIL:?}"
+
+
+if command -v getenforce >/dev/null 2>&1; then
+  setsebool -P httpd_can_network_connect 1 || true
+fi
+
+
+mkdir -p /var/www/html
+echo OK > /var/www/html/healthz.html
+chown apache:apache /var/www/html/healthz.html
+chmod 644 /var/www/html/healthz.html
+
+if [ ! -d /var/www/html/gnuboard ]; then
+  git clone --depth 1 https://github.com/gnuboard/gnuboard5.git /var/www/html/gnuboard
+fi
+
+
+if [ -d /var/www/html/gnuboard ]; then
+ 
+  mv /var/www/html/healthz.html /tmp/healthz.html || true
+  
+  shopt -s dotglob
+  mv /var/www/html/gnuboard/* /var/www/html/ 2>/dev/null || true
+  shopt -u dotglob
+  
+  mv /tmp/healthz.html /var/www/html/healthz.html || true
+ 
+  rmdir /var/www/html/gnuboard 2>/dev/null || true
+fi
+
+mkdir -p /var/www/html/data
+chown -R apache:apache /var/www/html
+chmod -R 755 /var/www/html
+chmod -R 707 /var/www/html/data
+
+
+cat > /var/www/html/data/dbconfig.php <<EOF
+<?php
+define('G5_MYSQL_HOST', '${DB_HOST}:${DB_PORT}');
+define('G5_MYSQL_USER', '${G5_USER}');
+define('G5_MYSQL_PASSWORD', '${G5_PASS}');
+define('G5_MYSQL_DB', '${G5_DB}');
+define('G5_MYSQL_SET_MODE', true);
+
+define('G5_TABLE_PREFIX', 'g5_');
+
+\$g5['table_prefix'] = G5_TABLE_PREFIX;
+\$g5['write_prefix'] = \$g5['table_prefix'] . 'write_';
+
+\$g5['auth_table']         = \$g5['table_prefix'] . 'auth';
+\$g5['config_table']       = \$g5['table_prefix'] . 'config';
+\$g5['group_table']        = \$g5['table_prefix'] . 'group';
+\$g5['group_member_table'] = \$g5['table_prefix'] . 'group_member';
+\$g5['board_table']        = \$g5['table_prefix'] . 'board';
+\$g5['board_file_table']   = \$g5['table_prefix'] . 'board_file';
+\$g5['board_good_table']   = \$g5['table_prefix'] . 'board_good';
+\$g5['board_new_table']    = \$g5['table_prefix'] . 'board_new';
+\$g5['login_table']        = \$g5['table_prefix'] . 'login';
+\$g5['mail_table']         = \$g5['table_prefix'] . 'mail';
+\$g5['member_table']       = \$g5['table_prefix'] . 'member';
+\$g5['memo_table']         = \$g5['table_prefix'] . 'memo';
+\$g5['poll_table']         = \$g5['table_prefix'] . 'poll';
+\$g5['poll_etc_table']     = \$g5['table_prefix'] . 'poll_etc';
+\$g5['point_table']        = \$g5['table_prefix'] . 'point';
+\$g5['popular_table']      = \$g5['table_prefix'] . 'popular';
+\$g5['qa_config_table']    = \$g5['table_prefix'] . 'qa_config';
+\$g5['qa_content_table']   = \$g5['table_prefix'] . 'qa_content';
+\$g5['scrap_table']        = \$g5['table_prefix'] . 'scrap';
+\$g5['visit_table']        = \$g5['table_prefix'] . 'visit';
+\$g5['visit_sum_table']    = \$g5['table_prefix'] . 'visit_sum';
+?>
+EOF
+chown apache:apache /var/www/html/data/dbconfig.php
+chmod 640 /var/www/html/data/dbconfig.php
+
+
+cat > /etc/php.d/99-gnuboard-session.ini <<'INI'
+session.cookie_path = "/"
+; domain은 비우는 게 안전 (host-only 쿠키)
+session.cookie_domain =
+INI
+
+systemctl restart php-fpm httpd
+
+for i in {1..120}; do
+  nc -z "$DB_HOST" "$DB_PORT" && break
+  sleep 2
+done
+nc -z "$DB_HOST" "$DB_PORT" || { echo "[ERROR] RDS not reachable"; exit 1; }
+
+
+export MYSQL_PWD="${RDS_MASTER_PW}"
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$RDS_MASTER" <<SQL
+CREATE DATABASE IF NOT EXISTS \`${G5_DB}\` DEFAULT CHARACTER SET utf8mb4;
+CREATE USER IF NOT EXISTS '${G5_USER}'@'%' IDENTIFIED BY '${G5_PASS}';
+ALTER USER '${G5_USER}'@'%' IDENTIFIED BY '${G5_PASS}';
+GRANT ALL PRIVILEGES ON \`${G5_DB}\`.* TO '${G5_USER}'@'%';
+FLUSH PRIVILEGES;
+SQL
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$RDS_MASTER" -e "USE \`${G5_DB}\`; SELECT 1;"
+unset MYSQL_PWD
+
+
+export MYSQL_PWD="${G5_PASS}"
+HAS_TABLE="$(mysql -h "$DB_HOST" -P "$DB_PORT" -u "$G5_USER" "$G5_DB" -Nse "SHOW TABLES LIKE 'g5_member';" || true)"
+if [ -z "$HAS_TABLE" ]; then
+  mysql -h "$DB_HOST" -P "$DB_PORT" -u "$G5_USER" "$G5_DB" < /var/www/html/install/gnuboard5.sql
+fi
+
+
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$G5_USER" "$G5_DB" <<SQL
+SET SESSION sql_mode='';
+INSERT INTO g5_config
+(cf_id, cf_title, cf_theme, cf_admin, cf_admin_email, cf_admin_email_name,
+ cf_use_point, cf_use_copy_log, cf_use_email_certify,
+ cf_new_skin, cf_search_skin, cf_connect_skin, cf_faq_skin, cf_member_skin,
+ cf_bbs_rewrite, cf_visit)
+VALUES
+(1,'GNUBoard5','',
+ '${ADMIN_ID}','${ADMIN_EMAIL}','관리자',
+ 0,0,0,
+ 'basic','basic','basic','basic','basic',
+ 0,'')
+ON DUPLICATE KEY UPDATE
+cf_admin=VALUES(cf_admin),
+cf_admin_email=VALUES(cf_admin_email),
+cf_admin_email_name=VALUES(cf_admin_email_name);
+SQL
+
+
+cat > /tmp/ensure_admin.php <<'PHP'
+<?php
+$_SERVER['HTTP_HOST']      = getenv('HTTP_HOST') ?: 'localhost';
+$_SERVER['SERVER_NAME']    = $_SERVER['HTTP_HOST'];
+$_SERVER['SERVER_PORT']    = 80;
+$_SERVER['REQUEST_URI']    = '/';
+$_SERVER['DOCUMENT_ROOT']  = '/var/www/html';
+$_SERVER['REMOTE_ADDR']    = '127.0.0.1';
+
+$admin_id    = getenv('ADMIN_ID') ?: 'webmaster';
+$admin_pw    = getenv('ADMIN_PW') ?: 'Password';
+$admin_email = getenv('ADMIN_EMAIL') ?: 'webmaster@example.com';
+
+chdir('/var/www/html');
+include './common.php';
+
+$hash = get_encrypt_string($admin_pw);
+
+$exists = sql_fetch("SELECT COUNT(*) AS cnt FROM {$g5['member_table']} WHERE mb_id='{$admin_id}'");
+if ((int)$exists['cnt'] === 0) {
+    sql_query("INSERT INTO {$g5['member_table']}
+      (mb_id, mb_password, mb_name, mb_nick, mb_email, mb_level, mb_datetime, mb_ip, mb_leave_date, mb_intercept_date)
+      VALUES
+      ('{$admin_id}', '{$hash}', '관리자', 'admin', '{$admin_email}', 10, NOW(), '127.0.0.1', '', '')");
+    echo "ADMIN:INSERTED\n";
+} else {
+    sql_query("UPDATE {$g5['member_table']}
+      SET mb_password='{$hash}',
+          mb_level=10,
+          mb_email='{$admin_email}',
+          mb_leave_date='',
+          mb_intercept_date=''
+      WHERE mb_id='{$admin_id}'");
+    echo "ADMIN:UPDATED\n";
+}
+
+$check = sql_fetch("SELECT mb_id, mb_level, LENGTH(mb_password) AS pwlen FROM {$g5['member_table']} WHERE mb_id='{$admin_id}'");
+echo "ADMIN:CHECK:".json_encode($check, JSON_UNESCAPED_UNICODE)."\n";
+PHP
+
+export ADMIN_ID ADMIN_PW ADMIN_EMAIL
+export HTTP_HOST="gnuboard.iac.it-edu.org"
+php /tmp/ensure_admin.php
+rm -f /tmp/ensure_admin.php
+unset MYSQL_PWD
+
+
+touch /var/www/html/data/install.lock
+chown apache:apache /var/www/html/data/install.lock
+chmod 640 /var/www/html/data/install.lock
+
+
+# BASE_URL에서 /gnuboard 제거
+BASE_URL_ROOT=$(echo "${BASE_URL}" | sed 's|/gnuboard$||' | sed 's|/gnuboard/$||')
+if grep -q "^define('G5_DOMAIN'" /var/www/html/config.php; then
+  sed -i "s|^define('G5_DOMAIN'.*|define('G5_DOMAIN', '$${BASE_URL_ROOT}');|g" /var/www/html/config.php
+else
+  echo "define('G5_DOMAIN', '$${BASE_URL_ROOT}');" >> /var/www/html/config.php
+fi
+
+if grep -q "^define('G5_COOKIE_DOMAIN'" /var/www/html/config.php; then
+  sed -i "s|^define('G5_COOKIE_DOMAIN'.*|define('G5_COOKIE_DOMAIN', '');|g" /var/www/html/config.php
+else
+  echo "define('G5_COOKIE_DOMAIN', '');" >> /var/www/html/config.php
+fi
+
+systemctl restart php-fpm httpd
+
+
+curl -fsS -I http://127.0.0.1/ >/dev/null
+
+
+rm -rf /var/www/html/install || true
+
+echo "DONE"
+echo "URL  : ${BASE_URL}/"
+echo "ADMIN: ${ADMIN_ID} / ${ADMIN_PW}"

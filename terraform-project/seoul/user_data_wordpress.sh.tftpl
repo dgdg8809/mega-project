@@ -1,0 +1,157 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+dnf -y clean all
+dnf -y install --allowerasing \
+  httpd \
+  php8.3 php8.3-cli php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip \
+  php8.3-mysqlnd php8.3-fpm \
+  git unzip amazon-efs-utils curl-minimal nc rsync
+
+# DB client (best-effort)
+dnf -y install php-curl || true
+dnf -y install mariadb105 || true
+
+systemctl enable --now httpd
+systemctl enable --now php-fpm
+
+DB_HOST="${DB_HOST}"
+DB_PORT="${DB_PORT}"
+RDS_MASTER="${RDS_MASTER}"
+RDS_MASTER_PW="${RDS_MASTER_PW}"
+
+WP_DB="${WP_DB}"
+WP_USER="${WP_USER}"
+WP_PASS="${WP_PASS}"
+
+WP_ADMIN_USER="${WP_ADMIN_USER}"
+WP_ADMIN_PASS="${WP_ADMIN_PASS}"
+WP_ADMIN_EMAIL="${WP_ADMIN_EMAIL}"
+WP_SITE_TITLE="${WP_SITE_TITLE}"
+WP_URL="${WP_URL}"
+
+
+mkdir -p /var/www/html
+cat > /var/www/html/healthz.html <<'HTML'
+OK
+HTML
+
+
+if command -v getenforce >/dev/null 2>&1; then
+  setsebool -P httpd_can_network_connect 1 || true
+fi
+
+
+cat > /etc/httpd/conf.d/wordpress.conf <<'CONF'
+<Directory "/var/www/html">
+    AllowOverride All
+    Options FollowSymLinks
+    Require all granted
+</Directory>
+CONF
+
+
+for i in {1..120}; do
+  nc -z "$DB_HOST" "$DB_PORT" && break
+  sleep 2
+done
+nc -z "$DB_HOST" "$DB_PORT" || { echo "[ERROR] RDS not reachable"; exit 1; }
+
+export MYSQL_PWD="${RDS_MASTER_PW}"
+mysql -h "$DB_HOST" -P "$DB_PORT" -u "$RDS_MASTER" <<SQL
+CREATE DATABASE IF NOT EXISTS \`${WP_DB}\` DEFAULT CHARACTER SET utf8mb4;
+CREATE USER IF NOT EXISTS '${WP_USER}'@'%' IDENTIFIED BY '${WP_PASS}';
+ALTER USER '${WP_USER}'@'%' IDENTIFIED BY '${WP_PASS}';
+GRANT ALL PRIVILEGES ON \`${WP_DB}\`.* TO '${WP_USER}'@'%';
+FLUSH PRIVILEGES;
+SQL
+unset MYSQL_PWD
+
+
+if [ ! -f /var/www/html/wp-settings.php ]; then
+  # 기존 파일 백업 (healthz.html 제외)
+  mv /var/www/html/healthz.html /tmp/healthz.html || true
+  # WordPress 다운로드 및 압축 해제
+  curl -fsSL https://wordpress.org/latest.tar.gz -o /tmp/wp.tgz
+  tar -xzf /tmp/wp.tgz -C /tmp
+  # WordPress 파일을 루트로 이동
+  rsync -a /tmp/wordpress/ /var/www/html/
+  rm -rf /tmp/wordpress /tmp/wp.tgz
+  # healthz.html 복원
+  mv /tmp/healthz.html /var/www/html/healthz.html || true
+fi
+
+
+if ! command -v wp >/dev/null 2>&1; then
+  curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp
+  chmod +x /usr/local/bin/wp
+fi
+
+chown -R apache:apache /var/www/html
+chmod -R 755 /var/www/html
+
+cd /var/www/html
+
+
+if [ ! -f /var/www/html/wp-config.php ]; then
+  sudo -u apache wp config create \
+    --dbname="$WP_DB" --dbuser="$WP_USER" --dbpass="$WP_PASS" --dbhost="$DB_HOST:$DB_PORT" \
+    --dbcharset="utf8mb4" --skip-check --force
+fi
+
+WP_URL_ROOT=$(echo "$WP_URL" | sed 's|/wordpress$||' | sed 's|/wordpress/$||')
+if ! sudo -u apache wp core is-installed >/dev/null 2>&1; then
+  sudo -u apache wp core install \
+    --url="$WP_URL_ROOT" \
+    --title="$WP_SITE_TITLE" \
+    --admin_user="$WP_ADMIN_USER" \
+    --admin_password="$WP_ADMIN_PASS" \
+    --admin_email="$WP_ADMIN_EMAIL" \
+    --skip-email
+fi
+
+sudo -u apache wp option update home    "$WP_URL_ROOT" || true
+sudo -u apache wp option update siteurl "$WP_URL_ROOT" || true
+
+
+sudo -u apache wp language core install ko_KR --activate || true
+sudo -u apache wp option update WPLANG ko_KR || true
+
+sudo -u apache wp option update permalink_structure '/%postname%/' || true
+
+cat > /var/www/html/.htaccess <<'HT'
+# BEGIN WordPress
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase /
+RewriteRule ^index\.php$ - [L]
+RewriteCond %%{REQUEST_FILENAME} !-f
+RewriteCond %%{REQUEST_FILENAME} !-d
+RewriteRule . /index.php [L]
+</IfModule>
+# END WordPress
+HT
+chown apache:apache /var/www/html/.htaccess
+chmod 644 /var/www/html/.htaccess
+
+
+sudo -u apache wp rewrite flush --hard || true
+
+
+cat > /var/www/html/index.php <<'PHP'
+<?php
+define( 'WP_USE_THEMES', true );
+require __DIR__ . '/wp-blog-header.php';
+PHP
+chown apache:apache /var/www/html/index.php
+chmod 644 /var/www/html/index.php
+
+systemctl restart httpd php-fpm
+
+curl -fsSI "http://127.0.0.1/wp-json/" | egrep -i 'HTTP/|content-type' || true
+curl -fsS "http://127.0.0.1/wp-json/" | head -c 80 ; echo
+
+echo "DONE"
+echo "WP URL  : $WP_URL_ROOT"
+echo "WP ADMIN: $WP_ADMIN_USER / $WP_ADMIN_PASS"

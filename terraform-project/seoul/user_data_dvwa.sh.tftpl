@@ -1,0 +1,134 @@
+#!/bin/bash
+set -euo pipefail
+
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+dnf -y clean all
+
+
+dnf -y install --allowerasing \
+  httpd \
+  php8.3 php8.3-cli php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip \
+  php8.3-mysqlnd php8.3-fpm mariadb105 \
+  git unzip amazon-efs-utils curl-minimal nc
+
+
+dnf -y install php-curl || true
+dnf -y install mariadb105 || true
+
+
+systemctl enable --now httpd
+systemctl enable --now php-fpm || true
+
+
+cat > /var/www/html/healthz.html <<'HTML'
+OK
+HTML
+
+chown -R apache:apache /var/www/html || true
+chmod -R 755 /var/www/html || true
+
+
+setsebool -P httpd_can_network_connect on || true
+
+
+grep -q '^allow_url_include' /etc/php.ini \
+  && sed -i 's/^allow_url_include.*/allow_url_include = On/' /etc/php.ini \
+  || echo 'allow_url_include = On' >> /etc/php.ini
+
+
+grep -q '^display_errors' /etc/php.ini \
+  && sed -i 's/^display_errors.*/display_errors = On/' /etc/php.ini \
+  || echo 'display_errors = On' >> /etc/php.ini
+
+grep -q '^display_startup_errors' /etc/php.ini \
+  && sed -i 's/^display_startup_errors.*/display_startup_errors = On/' /etc/php.ini \
+  || echo 'display_startup_errors = On' >> /etc/php.ini
+
+systemctl restart php-fpm || true
+systemctl restart httpd || true
+
+
+if [ ! -d /var/www/html/dvwa ]; then
+  git clone --depth 1 https://github.com/digininja/DVWA.git /var/www/html/dvwa || true
+fi
+
+
+cp -f /var/www/html/dvwa/config/config.inc.php.dist \
+      /var/www/html/dvwa/config/config.inc.php || true
+
+cat > /var/www/html/dvwa/config/config.inc.php <<'PHP'
+<?php
+$DBMS = 'MySQL';
+
+define ('MYSQL', 'mysql');
+define ('SQLITE', 'sqlite');
+
+$_DVWA = array();
+$_DVWA['db_server']   = '${db_host}';
+$_DVWA['db_database'] = '${dvwa_db}';
+$_DVWA['db_user']     = '${dvwa_user}';
+$_DVWA['db_password'] = '${dvwa_pass}';
+$_DVWA['db_port']     = '${rds_port}';
+
+$_DVWA['default_security_level'] = 'low';
+$_DVWA['default_phpids_level']   = 'low';
+
+$_DVWA['SQLI_DB'] = MYSQL;
+?>
+PHP
+
+
+chown -R apache:apache /var/www/html || true
+chmod -R 755 /var/www/html || true
+chmod -R 777 /var/www/html/dvwa/hackable/uploads || true
+chmod -R 777 /var/www/html/dvwa/config || true
+
+
+mkdir -p /var/www/html/dvwa/external/phpids/0.6/lib/IDS/tmp || true
+chmod -R 777 /var/www/html/dvwa/external/phpids/0.6/lib/IDS/tmp || true
+
+
+RDS_HOST='${db_host}'
+RDS_PORT='${rds_port}'
+MASTER_USER='${rds_master}'
+MASTER_PASS='${rds_password}'
+
+echo "[INFO] Waiting RDS DNS/Port: $RDS_HOST:$RDS_PORT"
+for i in $(seq 1 60); do
+  getent hosts "$RDS_HOST" >/dev/null 2>&1 && break
+  sleep 2
+done
+
+for i in $(seq 1 60); do
+  nc -z "$RDS_HOST" "$RDS_PORT" >/dev/null 2>&1 && break
+  sleep 2
+done
+
+if command -v mysql >/dev/null 2>&1; then
+  export MYSQL_PWD="$MASTER_PASS"
+
+  for i in $(seq 1 60); do
+    mysql -h "$RDS_HOST" -P "$RDS_PORT" -u "$MASTER_USER" -e "SELECT 1;" >/dev/null 2>&1 && break
+    sleep 5
+  done
+
+  mysql -h "$RDS_HOST" -P "$RDS_PORT" -u "$MASTER_USER" <<SQL
+CREATE DATABASE IF NOT EXISTS \`${dvwa_db}\` DEFAULT CHARACTER SET utf8mb4;
+CREATE USER IF NOT EXISTS '${dvwa_user}'@'%' IDENTIFIED BY '${dvwa_pass}';
+ALTER USER '${dvwa_user}'@'%' IDENTIFIED BY '${dvwa_pass}';
+GRANT ALL PRIVILEGES ON \`${dvwa_db}\`.* TO '${dvwa_user}'@'%';
+FLUSH PRIVILEGES;
+SQL
+
+  unset MYSQL_PWD
+else
+  echo "[WARN] mysql client not found; skipping DB init."
+fi
+
+systemctl restart php-fpm || true
+systemctl restart httpd || true
+
+echo "[DONE] DVWA"
+echo "URL  : http://<your-domain>/dvwa/"
+echo "DVWA : http://<your-domain>/dvwa/ (then run /dvwa/setup.php once)"
